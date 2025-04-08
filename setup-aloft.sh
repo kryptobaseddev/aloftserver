@@ -272,42 +272,66 @@ if ! command -v wine &> /dev/null; then
     step "Installing Wine"
     
     if [ "$PKG_MANAGER" = "apt-get" ]; then
-        # Add WineHQ repository
-        wget -nc https://dl.winehq.org/wine-builds/winehq.key
-        sudo apt-key add winehq.key
+        # More reliable Wine installation for Debian/Ubuntu
+        log "Adding 32-bit architecture support"
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
         
-        # Detect Ubuntu/Debian version
-        if [ -f /etc/debian_version ]; then
-            if grep -q "Ubuntu" /etc/issue; then
-                # Ubuntu
-                UBUNTU_CODENAME=$(lsb_release -cs)
-                sudo add-apt-repository "deb https://dl.winehq.org/wine-builds/ubuntu/ $UBUNTU_CODENAME main"
-            else
-                # Debian
-                DEBIAN_VERSION=$(cat /etc/debian_version | cut -d'.' -f1)
-                if [ "$DEBIAN_VERSION" = "10" ]; then
-                    sudo add-apt-repository "deb https://dl.winehq.org/wine-builds/debian/ buster main"
-                elif [ "$DEBIAN_VERSION" = "11" ]; then
-                    sudo add-apt-repository "deb https://dl.winehq.org/wine-builds/debian/ bullseye main"
+        log "Installing Wine from standard repositories"
+        sudo apt-get install -y wine wine64 winetricks
+        
+        # If the standard installation fails, try the alternative method
+        if [ $? -ne 0 ]; then
+            warn "Standard Wine installation failed, trying alternative method"
+            
+            # Remove any previous Wine repository configurations
+            sudo rm -f /etc/apt/sources.list.d/wine*
+            
+            # Add the WineHQ repository correctly (using signed-by instead of apt-key)
+            wget -O- https://dl.winehq.org/wine-builds/winehq.key | sudo gpg --dearmor -o /usr/share/keyrings/winehq.gpg
+            
+            # Detect Debian/Ubuntu version
+            if [ -f /etc/debian_version ]; then
+                if grep -q "Ubuntu" /etc/issue; then
+                    # Ubuntu
+                    UBUNTU_CODENAME=$(lsb_release -cs)
+                    echo "deb [signed-by=/usr/share/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/ubuntu/ $UBUNTU_CODENAME main" | sudo tee /etc/apt/sources.list.d/winehq.list
                 else
-                    sudo add-apt-repository "deb https://dl.winehq.org/wine-builds/debian/ bookworm main"
+                    # Debian
+                    DEBIAN_VERSION=$(cat /etc/debian_version | cut -d'.' -f1)
+                    DEBIAN_CODENAME="bookworm" # Default to bookworm
+                    
+                    if [ "$DEBIAN_VERSION" = "10" ]; then
+                        DEBIAN_CODENAME="buster"
+                    elif [ "$DEBIAN_VERSION" = "11" ]; then
+                        DEBIAN_CODENAME="bullseye"
+                    fi
+                    
+                    echo "deb [signed-by=/usr/share/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/debian/ $DEBIAN_CODENAME main" | sudo tee /etc/apt/sources.list.d/winehq.list
                 fi
             fi
+            
+            sudo apt-get update
+            sudo apt-get install -y --install-recommends winehq-stable
+            
+            # If that still fails, fall back to minimal Wine installation
+            if [ $? -ne 0 ]; then
+                warn "WineHQ installation failed, falling back to basic Wine"
+                sudo apt-get install -y wine
+            fi
         fi
-        
-        sudo apt-get update
-        sudo apt-get install -y --install-recommends winehq-stable
     else
         # RHEL/Fedora/CentOS
-        sudo dnf config-manager --add-repo https://dl.winehq.org/wine-builds/fedora/$(rpm -E %fedora)/winehq.repo
-        sudo dnf install -y winehq-stable
+        sudo dnf install -y wine wine-core winetricks
     fi
     
-    # Install winetricks
-    log "Installing winetricks"
-    wget https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks
-    chmod +x winetricks
-    sudo mv winetricks /usr/local/bin/
+    # Make sure winetricks is installed
+    if ! command -v winetricks &> /dev/null; then
+        log "Installing winetricks"
+        wget https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks
+        chmod +x winetricks
+        sudo mv winetricks /usr/local/bin/
+    fi
 fi
 
 step "Setting up server environment"
@@ -334,17 +358,61 @@ su - $SERVER_USER -c "WINEPREFIX=$WINE_PREFIX winetricks -q vcrun2019 dotnet48"
 
 step "Game Files Preparation"
 
-echo
-echo -e "${YELLOW}Important:${NC} You need to copy your Aloft game files to $GAME_FILES_DIR"
-echo "This script does not download the game, as it requires a valid Steam purchase."
-echo
-echo "The most important files needed:"
-echo "- Aloft.exe (Main game executable)"
-echo "- All game data files and subdirectories"
-echo
-echo "After running this script, copy your game files with a command like:"
-echo -e "${BLUE}cp -r /path/to/your/aloft/installation/* $GAME_FILES_DIR/${NC}"
-echo
+# Check if the Aloft zip file exists in the tmp directory
+if [ -f "/root/tmp/aloft.zip" ]; then
+    log "Found Aloft game files in /root/tmp/aloft.zip"
+    
+    # Create temporary extraction directory
+    EXTRACT_DIR="/tmp/aloft-extract"
+    mkdir -p $EXTRACT_DIR
+    
+    log "Extracting game files (this may take a few minutes for a 7GB file)..."
+    unzip -q "/root/tmp/aloft.zip" -d $EXTRACT_DIR
+    
+    if [ $? -eq 0 ]; then
+        log "Successfully extracted game files"
+        
+        # Look for the Aloft.exe file in the extracted directory
+        ALOFT_EXE=$(find $EXTRACT_DIR -name "Aloft.exe" -type f | head -1)
+        
+        if [ -n "$ALOFT_EXE" ]; then
+            log "Found Aloft.exe at $ALOFT_EXE"
+            
+            # Get the directory containing Aloft.exe
+            ALOFT_DIR=$(dirname "$ALOFT_EXE")
+            
+            log "Copying game files to $GAME_FILES_DIR..."
+            cp -r "$ALOFT_DIR"/* $GAME_FILES_DIR/
+            
+            # Set proper permissions
+            chown -R $SERVER_USER:$SERVER_USER $GAME_FILES_DIR
+            
+            log "Game files copied successfully"
+            
+            # Clean up
+            log "Cleaning up temporary files..."
+            rm -rf $EXTRACT_DIR
+        else
+            warn "Could not find Aloft.exe in the extracted files"
+            warn "The extraction may have created a subdirectory. Please check $EXTRACT_DIR"
+            warn "You will need to manually copy the game files to $GAME_FILES_DIR"
+        fi
+    else
+        error "Failed to extract the zip file. Please check if it's a valid zip archive."
+    fi
+else
+    echo
+    echo -e "${YELLOW}Important:${NC} You need to copy your Aloft game files to $GAME_FILES_DIR"
+    echo "This script did not find a zip file at /root/tmp/aloft.zip"
+    echo
+    echo "The most important files needed:"
+    echo "- Aloft.exe (Main game executable)"
+    echo "- All game data files and subdirectories"
+    echo
+    echo "After running this script, copy your game files with a command like:"
+    echo -e "${BLUE}cp -r /path/to/your/aloft/installation/* $GAME_FILES_DIR/${NC}"
+    echo
+fi
 
 # Create server scripts
 step "Creating server scripts and services"
